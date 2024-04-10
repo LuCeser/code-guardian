@@ -1,8 +1,9 @@
 import os
+from typing import Optional
 
 import requests
 from dotenv import load_dotenv
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Request, Header, HTTPException, Depends
 from ollama import Client
 
 from app.internal.logger import logger
@@ -85,8 +86,28 @@ def process_merge_request(project_id: int, merge_request_iid: int):
         logger.warn("Cannot get diffs with response code {0}", response.status_code)
 
 
+async def parse_gitlab_event(
+        request: Request,
+        x_gitlab_event: Optional[str] = Header(None),
+):
+    if x_gitlab_event != "Merge Request Hook":
+        logger.warn(f"The webhook only handle Merge Request Hook, the request header is: {x_gitlab_event}")
+        raise HTTPException(status_code=400, detail="Event type not supported")
+
+    # If it's a merge request hook, parse the body using the appropriate model
+    try:
+        body = await request.json()
+        return MergeRequestEvent(**body)
+    except Exception as e:
+        logger.error("Can't parse the request body", e)
+        raise HTTPException(status_code=400, detail="Error parsing request body")
+
+
 @router.post("/code-reviewer")
-async def handle_merge_request(background_tasks: BackgroundTasks, event: MergeRequestEvent):
+async def handle_merge_request(
+        background_tasks: BackgroundTasks,
+        event: MergeRequestEvent = Depends(parse_gitlab_event)
+):
     """
     receive webhook
     :param background_tasks: process background
