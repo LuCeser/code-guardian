@@ -16,6 +16,10 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST")
 if OLLAMA_HOST:
     ollama_client = Client(host=OLLAMA_HOST)
 
+OLLAMA_CODE_MODEL = os.getenv("OLLAMA_CODE_MODEL")
+if not OLLAMA_CODE_MODEL:
+    OLLAMA_CODE_MODEL = "codellama:13b"
+
 router = APIRouter()
 
 
@@ -61,9 +65,9 @@ def process_merge_request(project_id: int, merge_request_iid: int):
             formatted_diffs.append(f"File: {file_path}\nDiff:\n{diff}")
 
         prompt = "\n\n".join(formatted_diffs)
-        logger.info("Format diffs. Try to talk to LLM...")
+        logger.info(f"Format diffs. Try to talk to LLM with model {OLLAMA_CODE_MODEL}...")
         ollama_prompt = (f"Please review the following code changes:\n\n{prompt}\n\nProvide feedback on code quality, "
-                         f"style, potential bugs, and performance optimizations. please output with chinese")
+                         f"style, potential bugs, and performance optimizations.And please respond in chinese.")
 
         messages = [
             {
@@ -72,7 +76,7 @@ def process_merge_request(project_id: int, merge_request_iid: int):
             },
         ]
 
-        chat_prompt = ollama_client.chat(model="codellama:13b", messages=messages)
+        chat_prompt = ollama_client.chat(model=OLLAMA_CODE_MODEL, messages=messages)
         logger.info(f"get response {chat_prompt['message']['content']}")
 
         add_comment(project_id, merge_request_iid, chat_prompt['message']['content'])
@@ -89,8 +93,13 @@ async def handle_merge_request(background_tasks: BackgroundTasks, event: MergeRe
     :param event: merge request event
     :return: http response
     """
-    logger.info(f"Receive Merge Request with Project {event.project.name}, Title {event.object_attributes.title}")
-    background_tasks.add_task(process_merge_request, event.project.id, event.object_attributes.iid)
+
+    logger.info(f"Receive Merge Request with Project {event.project.name}, Title {event.object_attributes.title}, "
+                f"Merge Status {event.object_attributes.state}")
+    if event.object_attributes.state == 'opened':
+        background_tasks.add_task(process_merge_request, event.project.id, event.object_attributes.iid)
+    else:
+        logger.info(f"Merge Request State is {event.object_attributes.state}, won't be review")
 
     # Return a response
     return {"message": "Received", "merge_request_id": event.object_attributes.id}
