@@ -28,7 +28,7 @@ class Project(BaseModel):
 
 
 class ObjectAttributes(BaseModel):
-    assignee_id: int
+    assignee_id: Optional[int] = None
     author_id: int
     created_at: str
     id: int
