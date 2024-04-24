@@ -4,24 +4,25 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, Request, Header, HTTPException, Depends
-from ollama import Client
+from fastapi.templating import Jinja2Templates
+from sqlmodel import Session
 
+from app.db.orm import get_session
 from app.internal.logger import logger
+from app.llm.llm_core import LLMOllama
+from app.models.task import Task
 from app.models.webhook import MergeRequestEvent
 
 load_dotenv()
 GITLAB_ACCESS_TOKEN = os.getenv("GITLAB_ACCESS_TOKEN")
 GITLAB_BASE_URL = os.getenv("GITLAB_BASE_URL")
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST")
-if OLLAMA_HOST:
-    ollama_client = Client(host=OLLAMA_HOST)
-
-OLLAMA_CODE_MODEL = os.getenv("OLLAMA_CODE_MODEL")
-if not OLLAMA_CODE_MODEL:
-    OLLAMA_CODE_MODEL = "codellama:13b"
+llm = LLMOllama()
 
 router = APIRouter()
+
+# Setup the Jinja2 template environment
+templates = Jinja2Templates(directory="templates")
 
 
 def add_comment(project_id: int, merge_request_iid: int, comment: str):
@@ -56,31 +57,7 @@ def process_merge_request(project_id: int, merge_request_iid: int):
 
     if response.status_code == 200:
         logger.info("Get Diffs Success.")
-
-        formatted_diffs = []
-        changes = response.json()["changes"]
-        for change in changes:
-            file_path = change["new_path"]
-            diff = change["diff"]
-            # Append a formatted string for each change to the list
-            formatted_diffs.append(f"File: {file_path}\nDiff:\n{diff}")
-
-        prompt = "\n\n".join(formatted_diffs)
-        logger.info(f"Format diffs. Try to talk to LLM with model {OLLAMA_CODE_MODEL}...")
-        ollama_prompt = (f"Please review the following code changes:\n\n{prompt}\n\nProvide feedback on code quality, "
-                         f"style, potential bugs, and performance optimizations.And please respond in chinese.")
-
-        messages = [
-            {
-                'role': 'user',
-                'content': ollama_prompt,
-            },
-        ]
-
-        chat_prompt = ollama_client.chat(model=OLLAMA_CODE_MODEL, messages=messages)
-        logger.info(f"get response {chat_prompt['message']['content']}")
-
-        add_comment(project_id, merge_request_iid, chat_prompt['message']['content'])
+        add_comment(project_id, merge_request_iid, llm.review(response.json()["changes"]))
 
     else:
         logger.warn("Cannot get diffs with response code {0}", response.status_code)
@@ -106,21 +83,71 @@ async def parse_gitlab_event(
 @router.post("/code-reviewer")
 async def handle_merge_request(
         background_tasks: BackgroundTasks,
-        event: MergeRequestEvent = Depends(parse_gitlab_event)
+        event: MergeRequestEvent = Depends(parse_gitlab_event),
+        db: Session = Depends(get_session)
 ):
     """
     receive webhook
     :param background_tasks: process background
     :param event: merge request event
+    :param db: db to save
     :return: http response
     """
 
     logger.info(f"Receive Merge Request with Project {event.project.name}, Title {event.object_attributes.title}, "
                 f"Merge Status {event.object_attributes.state}")
     if event.object_attributes.state == 'opened':
+        task = Task()
+        task.project_id = event.project.id
+        task.merge_request_iid = event.object_attributes.iid
+        task.status = "pending"
+        task.source_url = event.object_attributes.url
+
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
         background_tasks.add_task(process_merge_request, event.project.id, event.object_attributes.iid)
     else:
         logger.info(f"Merge Request State is {event.object_attributes.state}, won't be review")
 
     # Return a response
     return {"message": "Received", "merge_request_id": event.object_attributes.id}
+
+
+@router.get("/models")
+async def available_models():
+    """
+    list all available models
+    :return: ["model1", "model2"]
+    """
+    query_ret = llm.list_models()
+    ret = []
+    for model in query_ret['models']:
+        ret.append(model['name'])
+    return ret
+
+
+@router.post("/models/activate")
+async def change_current_model(data: dict):
+    logger.info(f"Change model from {llm.activate_model()} to {data}")
+    llm.change_model(data['model'])
+
+
+@router.get("/models/activate")
+async def current_model():
+    """
+    display which llm model is use now
+    :return:
+    """
+    return {"model": llm.activate_model(), "description": ""}
+
+
+@router.get("/")
+async def read_root(request: Request):
+    """
+    main page
+    :param request: request
+    :return: index.html
+    """
+    return templates.TemplateResponse("index.html", {"request": request})
